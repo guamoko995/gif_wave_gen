@@ -15,6 +15,7 @@ type cell struct {
 	height    float64
 	speed     float64
 	mass      float64
+	gain      float64
 	neighbors []*cell
 }
 
@@ -29,6 +30,7 @@ func (c *cell) calcSpeed() {
 	}
 	force /= float64(len(c.neighbors))
 	acceleration := force / c.mass
+	c.speed *= c.gain
 	c.speed += acceleration
 }
 
@@ -85,23 +87,26 @@ func (s *space) pixSetter(index <-chan dot, wg *sync.WaitGroup) {
 	}
 }
 
-func (s *space) simulate(frames, stepsPerFrame, speedCalcers, hightSetters, pixSetters int) *gif.GIF {
+func (s *space) simulate(frames, stepsPerFrame, speedCalcers, heightCalcers, pixSetters int) *gif.GIF {
 
 	wg := &sync.WaitGroup{}
 	count := s.sizeX * s.sizeY
 
+	// speed calcs pool
 	cellsSpeed := make(chan dot, speedCalcers)
 	defer close(cellsSpeed)
 	for i := 0; i < speedCalcers; i++ {
 		go s.speedCalcer(cellsSpeed, wg)
 	}
 
-	cellsHight := make(chan dot, hightSetters)
-	defer close(cellsHight)
-	for i := 0; i < hightSetters; i++ {
-		go s.heightSetter(cellsHight, wg)
+	// height calcers pool
+	cellsHeight := make(chan dot, heightCalcers)
+	defer close(cellsHeight)
+	for i := 0; i < heightCalcers; i++ {
+		go s.heightSetter(cellsHeight, wg)
 	}
 
+	// pix setters pool
 	setPix := make(chan dot, pixSetters)
 	defer close(setPix)
 	for i := 0; i < pixSetters; i++ {
@@ -113,8 +118,11 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, hightSetters, pixS
 		pallette = append(pallette, color.RGBA{0, uint8(i / 2), uint8(i), 255})
 	}
 	images := make([]*image.Paletted, 0, frames)
+
+	// wave generation
 	steps := stepsPerFrame * frames
 	for i := 0; i < steps; i++ {
+		// recalc all speeds
 		wg.Add(count)
 		for x := 0; x < s.sizeX; x++ {
 			for y := 0; y < s.sizeY; y++ {
@@ -123,18 +131,20 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, hightSetters, pixS
 		}
 		wg.Wait()
 
+		// speeds adjustment by external influence
 		s.extInfluence(i)
 
+		// recalc all height
 		wg.Add(count)
 		for x := 0; x < s.sizeX; x++ {
 			for y := 0; y < s.sizeY; y++ {
-				cellsHight <- dot{x: x, y: y}
+				cellsHeight <- dot{x: x, y: y}
 			}
 		}
 		wg.Wait()
 
+		// heights snapshot generation
 		if i%stepsPerFrame == 0 {
-
 			s.paletted = image.NewPaletted(image.Rect(0, 0, s.sizeX, s.sizeY), pallette)
 			wg.Add(count)
 			for x := 0; x < s.sizeX; x++ {
@@ -146,6 +156,7 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, hightSetters, pixS
 			images = append(images, s.paletted)
 		}
 	}
+
 	return &gif.GIF{
 		Image: images,
 		Delay: make([]int, frames),
@@ -164,6 +175,7 @@ func newSpace(sizeX int, sizeY int, cellMass float64) *space {
 		for y := range s.field[x] {
 			s.field[x][y] = &cell{}
 			s.field[x][y].mass = cellMass
+			s.field[x][y].gain = 1
 		}
 	}
 
@@ -198,18 +210,30 @@ func main() {
 
 	s := newSpace(501, 501, 10)
 
-	// создаем линзу с двойной массой в центре пространства
+	// линза
 	for x := 0; x < s.sizeX; x++ {
 		for y := 0; y < s.sizeY; y++ {
 			if (x-330)*(x-330)+(y-250)*(y-250) < 100*100 && (x-170)*(x-170)+(y-250)*(y-250) < 100*100 {
 				s.field[x][y].mass *= 2
 			}
+
+			if y < 100 || 500-y < 100 {
+				s.field[x][y].mass *= 0.99
+				s.field[x][y].gain *= 0.99
+			}
+
+			/*w := 20
+			if y < int(10*math.Abs(float64((x%w)-w/2))) || 500-y < int(10*math.Abs(float64((x%w)-w/2))) {
+				s.field[x][y].mass /= 5
+			}*/
 		}
 	}
 
+	// внешнее воздействие
 	s.extInfluence = func(step int) {
-		if step < 250 {
-			s.field[100][250].speed += 1 * math.Sin(float64(step)*(math.Pi/50))
+		if step < 300 {
+			s.field[0][250].speed += math.Sin(float64(step) * (math.Pi / 100))
+			s.field[0][251].speed += math.Sin(float64(step) * (math.Pi / 100))
 		}
 	}
 
