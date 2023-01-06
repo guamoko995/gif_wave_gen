@@ -11,53 +11,131 @@ import (
 	"time"
 )
 
-type cell struct {
-	height    float64
-	speed     float64
-	mass      float64
-	gain      float64
-	neighbors []*cell
-}
+type vector []float64
 
-func (c *cell) calcHeight() {
-	c.height += c.speed
-}
-
-func (c *cell) calcSpeed() {
-	var force float64
-	for _, n := range c.neighbors {
-		force += n.height - c.height
+func dotProductOfVectors(a, b vector) (vector, error) {
+	if len(a) != len(b) {
+		return vector{}, fmt.Errorf("dimension does not match")
 	}
-	force /= float64(len(c.neighbors))
-	acceleration := force / c.mass
-	c.speed *= c.gain
-	c.speed += acceleration
+	c := make(vector, len(a))
+	for i := range c {
+		c[i] = a[i] * b[i]
+	}
+	return c, nil
+}
+
+func lorSummSpeed(Ax, Ay, Az, Bx, By, Bz, cc float64) (Sx, Sy, Sz float64) {
+	absSpeedA := math.Sqrt(Ax*Ax + Ay*Ay + Az*Az)
+	absSpeedB := math.Sqrt(Bx*Bx + By*By + Bz*Bz)
+	relativisticFactor := 1.0 + absSpeedA*absSpeedB/cc
+	Sx = (Ax + Bx) / relativisticFactor
+	Sy = (Ay + By) / relativisticFactor
+	Sz = (Az + Bz) / relativisticFactor
+	return
+}
+
+type matter struct {
+	mass         float64
+	location     *cell
+	lastLocation *cell
+
+	biasX  float64
+	speedX float64
+
+	biasY  float64
+	speedY float64
+}
+
+type cell struct {
+	space             *space
+	perturbationBias  float64
+	perturbationSpeed float64
+	weight            *matter
+
+	lastX *cell
+	nextX *cell
+
+	lastY *cell
+	nextY *cell
+}
+
+func (m *matter) calcSpeed() {
+	incrX := m.lastLocation.nextX.perturbationBias - m.lastLocation.lastX.perturbationBias
+	incrY := m.lastLocation.nextY.perturbationBias - m.lastLocation.lastY.perturbationBias
+
+	m.speedX, m.speedY, m.lastLocation.perturbationSpeed = lorSummSpeed(m.speedX, m.speedY, m.lastLocation.perturbationSpeed, incrX, incrY, 0, m.lastLocation.space.speedOfLightSquared)
+}
+
+func (m *matter) calcBias() {
+	m.biasX += m.speedX
+	m.biasY += m.speedY
+}
+
+func (m *matter) leap() {
+	distanation := m.location
+	switch {
+	case m.biasX > 0.5:
+		m.biasX -= 1
+		distanation = distanation.nextX
+	case m.biasX < -0.5:
+		m.biasX += 1
+		distanation = distanation.lastX
+	}
+	switch {
+	case m.biasY > 0.5:
+		m.biasY -= 1
+		distanation = distanation.nextY
+	case m.biasY < -0.5:
+		m.biasY += 1
+		distanation = distanation.lastY
+	}
+
+	m.lastLocation = m.location
+
+	if distanation != m.location {
+		m.location.weight = nil
+		m.location = distanation
+		m.location.weight = m
+	}
+}
+
+func (c *cell) calcPerturbationBias() {
+	c.perturbationBias += c.perturbationSpeed
+}
+
+func (c *cell) calcPerturbationSpeed() {
+	var force float64
+
+	force += c.lastX.perturbationBias - c.perturbationBias
+	force += c.nextX.perturbationBias - c.perturbationBias
+
+	force += c.lastY.perturbationBias - c.perturbationBias
+	force += c.nextY.perturbationBias - c.perturbationBias
+
+	acseleration := force * c.space.speedOfLightSquared
+
+	if c.weight == nil {
+		_, _, c.perturbationSpeed = lorSummSpeed(0, 0, c.perturbationSpeed, 0, 0, acseleration, c.space.speedOfLightSquared)
+	} else {
+		c.weight.speedX, c.weight.speedY, c.perturbationSpeed = lorSummSpeed(c.weight.speedX, c.weight.speedY, c.perturbationSpeed, 0, 0, acseleration, c.space.speedOfLightSquared)
+		c.weight.speedX, c.weight.speedY, c.perturbationSpeed = lorSummSpeed(c.weight.speedX, c.weight.speedY, c.perturbationSpeed, 0, 0, c.weight.mass, c.space.speedOfLightSquared)
+	}
 }
 
 func (c *cell) getColor() color.Color {
-	for _, n := range c.neighbors {
-		if n.mass > c.mass {
-			return color.Gray{
-				Y: 255,
-			}
-		}
-		if n.mass < c.mass {
-			return color.Gray{
-				Y: 0,
-			}
-		}
+	if c.weight != nil {
+		return color.Gray{Y: 255}
 	}
-	return color.Gray{
-		Y: uint8(10*c.height + 128),
-	}
+	return color.Gray{Y: uint8(c.perturbationBias)}
 }
 
 type space struct {
-	field        [][]*cell
-	sizeX        int
-	sizeY        int
-	extInfluence func(step int)
-	paletted     *image.Paletted
+	field               [][]*cell
+	sizeX               int
+	sizeY               int
+	speedOfLightSquared float64
+	extInfluence        func(step int)
+	paletted            *image.Paletted
 }
 
 type dot struct {
@@ -65,52 +143,94 @@ type dot struct {
 	y int
 }
 
-func (s *space) speedCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+func (s *space) perturbationSpeedCalcer(dots <-chan dot, wg *sync.WaitGroup) {
 	for dot := range dots {
-		s.field[dot.x][dot.y].calcSpeed()
+		s.field[dot.x][dot.y].calcPerturbationSpeed()
 		wg.Done()
 	}
 }
 
-func (s *space) heightSetter(index <-chan dot, wg *sync.WaitGroup) {
-	for in := range index {
-		s.field[in.x][in.y].calcHeight()
+func (s *space) weightSpeedCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+	for dot := range dots {
+		if weight := s.field[dot.x][dot.y].weight; weight != nil {
+			weight.calcSpeed()
+		}
 		wg.Done()
 	}
 }
 
-func (s *space) pixSetter(index <-chan dot, wg *sync.WaitGroup) {
-	for in := range index {
-		color := s.field[in.x][in.y].getColor()
-		s.paletted.Set(in.x, in.y, color)
+func (s *space) perturbationBiasCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+	for dot := range dots {
+		s.field[dot.x][dot.y].calcPerturbationBias()
 		wg.Done()
 	}
 }
 
-func (s *space) simulate(frames, stepsPerFrame, speedCalcers, heightCalcers, pixSetters int) *gif.GIF {
+func (s *space) weightBiasCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+	for dot := range dots {
+		if weight := s.field[dot.x][dot.y].weight; weight != nil {
+			weight.calcBias()
+		}
+		wg.Done()
+	}
+}
+
+func (s *space) leapCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+	for dot := range dots {
+		if weight := s.field[dot.x][dot.y].weight; weight != nil {
+			weight.leap()
+		}
+		wg.Done()
+	}
+}
+
+func (s *space) pixelCalcer(dots <-chan dot, wg *sync.WaitGroup) {
+	for dot := range dots {
+		color := s.field[dot.x][dot.y].getColor()
+		s.paletted.Set(dot.x, dot.y, color)
+		wg.Done()
+	}
+}
+
+func (s *space) simulate(frames, stepsPerFrame, calcers int) *gif.GIF {
 
 	wg := &sync.WaitGroup{}
 	count := s.sizeX * s.sizeY
 
-	// speed calcs pool
-	cellsSpeed := make(chan dot, speedCalcers)
-	defer close(cellsSpeed)
-	for i := 0; i < speedCalcers; i++ {
-		go s.speedCalcer(cellsSpeed, wg)
+	perturbationSpeed := make(chan dot, calcers)
+	defer close(perturbationSpeed)
+	for i := 0; i < calcers; i++ {
+		go s.perturbationSpeedCalcer(perturbationSpeed, wg)
 	}
 
-	// height calcers pool
-	cellsHeight := make(chan dot, heightCalcers)
-	defer close(cellsHeight)
-	for i := 0; i < heightCalcers; i++ {
-		go s.heightSetter(cellsHeight, wg)
+	perturbationBias := make(chan dot, calcers)
+	defer close(perturbationBias)
+	for i := 0; i < calcers; i++ {
+		go s.perturbationBiasCalcer(perturbationBias, wg)
 	}
 
-	// pix setters pool
-	setPix := make(chan dot, pixSetters)
-	defer close(setPix)
-	for i := 0; i < pixSetters; i++ {
-		go s.pixSetter(setPix, wg)
+	weightSpeed := make(chan dot, calcers)
+	defer close(weightSpeed)
+	for i := 0; i < calcers; i++ {
+		go s.weightSpeedCalcer(weightSpeed, wg)
+	}
+
+	weightBias := make(chan dot, calcers)
+	defer close(weightBias)
+	for i := 0; i < calcers; i++ {
+		go s.weightBiasCalcer(weightBias, wg)
+	}
+
+	leap := make(chan dot, calcers)
+	defer close(leap)
+	for i := 0; i < calcers; i++ {
+		go s.leapCalcer(leap, wg)
+	}
+
+	pixel := make(chan dot, calcers)
+	defer close(pixel)
+	for i := 0; i < calcers; i++ {
+		go s.pixelCalcer(pixel, wg)
 	}
 
 	pallette := make([]color.Color, 0, 256)
@@ -122,23 +242,45 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, heightCalcers, pix
 	// wave generation
 	steps := stepsPerFrame * frames
 	for i := 0; i < steps; i++ {
-		// recalc all speeds
+		// speeds adjustment by external influence
+		s.extInfluence(i)
+
 		wg.Add(count)
 		for x := 0; x < s.sizeX; x++ {
 			for y := 0; y < s.sizeY; y++ {
-				cellsSpeed <- dot{x: x, y: y}
+				perturbationSpeed <- dot{x: x, y: y}
 			}
 		}
 		wg.Wait()
 
-		// speeds adjustment by external influence
-		s.extInfluence(i)
-
-		// recalc all height
 		wg.Add(count)
 		for x := 0; x < s.sizeX; x++ {
 			for y := 0; y < s.sizeY; y++ {
-				cellsHeight <- dot{x: x, y: y}
+				perturbationBias <- dot{x: x, y: y}
+			}
+		}
+		wg.Wait()
+
+		wg.Add(count)
+		for x := 0; x < s.sizeX; x++ {
+			for y := 0; y < s.sizeY; y++ {
+				weightSpeed <- dot{x: x, y: y}
+			}
+		}
+		wg.Wait()
+
+		wg.Add(count)
+		for x := 0; x < s.sizeX; x++ {
+			for y := 0; y < s.sizeY; y++ {
+				weightBias <- dot{x: x, y: y}
+			}
+		}
+		wg.Wait()
+
+		wg.Add(count)
+		for x := 0; x < s.sizeX; x++ {
+			for y := 0; y < s.sizeY; y++ {
+				leap <- dot{x: x, y: y}
 			}
 		}
 		wg.Wait()
@@ -149,7 +291,7 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, heightCalcers, pix
 			wg.Add(count)
 			for x := 0; x < s.sizeX; x++ {
 				for y := 0; y < s.sizeY; y++ {
-					setPix <- dot{x: x, y: y}
+					pixel <- dot{x: x, y: y}
 				}
 			}
 			wg.Wait()
@@ -163,10 +305,11 @@ func (s *space) simulate(frames, stepsPerFrame, speedCalcers, heightCalcers, pix
 	}
 }
 
-func newSpace(sizeX int, sizeY int, cellMass float64) *space {
+func newSpace(sizeX int, sizeY int, speedOfLight float64) *space {
 	s := &space{
-		sizeX: sizeX,
-		sizeY: sizeY,
+		sizeX:               sizeX,
+		sizeY:               sizeY,
+		speedOfLightSquared: speedOfLight * speedOfLight,
 	}
 
 	s.field = make([][]*cell, sizeX)
@@ -174,32 +317,33 @@ func newSpace(sizeX int, sizeY int, cellMass float64) *space {
 		s.field[x] = make([]*cell, sizeY)
 		for y := range s.field[x] {
 			s.field[x][y] = &cell{}
-			s.field[x][y].mass = cellMass
-			s.field[x][y].gain = 1
+			s.field[x][y].space = s
 		}
 	}
 
 	for x := 0; x < sizeX; x++ {
 		for y := 0; y < sizeY; y++ {
-			yNorth := y - 1
-			if yNorth >= 0 && yNorth < sizeY {
-				s.field[x][y].neighbors = append(s.field[x][y].neighbors, s.field[x][yNorth])
+			loop := func(val, size int) int {
+				switch {
+				case val < 0:
+					val += size
+				case val >= size:
+					val -= size
+				}
+				return val
 			}
 
-			ySouth := y + 1
-			if ySouth >= 0 && ySouth < sizeY {
-				s.field[x][y].neighbors = append(s.field[x][y].neighbors, s.field[x][ySouth])
-			}
+			lastY := loop(y-1, sizeY)
+			s.field[x][y].lastY = s.field[x][lastY]
 
-			xWest := x - 1
-			if xWest >= 0 && xWest < sizeX {
-				s.field[x][y].neighbors = append(s.field[x][y].neighbors, s.field[xWest][y])
-			}
+			nextY := loop(y+1, sizeY)
+			s.field[x][y].nextY = s.field[x][nextY]
 
-			xEast := x + 1
-			if xEast >= 0 && xEast < sizeX {
-				s.field[x][y].neighbors = append(s.field[x][y].neighbors, s.field[xEast][y])
-			}
+			lastX := loop(x-1, sizeX)
+			s.field[x][y].lastX = s.field[lastX][y]
+
+			nextX := loop(x+1, sizeX)
+			s.field[x][y].nextX = s.field[nextX][y]
 		}
 	}
 	return s
@@ -208,36 +352,22 @@ func newSpace(sizeX int, sizeY int, cellMass float64) *space {
 func main() {
 	t := time.Now()
 
-	s := newSpace(501, 501, 10)
+	s := newSpace(501, 501, 0.2)
 
-	// линза
-	for x := 0; x < s.sizeX; x++ {
-		for y := 0; y < s.sizeY; y++ {
-			if (x-330)*(x-330)+(y-250)*(y-250) < 100*100 && (x-170)*(x-170)+(y-250)*(y-250) < 100*100 {
-				s.field[x][y].mass *= 2
-			}
-
-			if y < 100 || 500-y < 100 {
-				s.field[x][y].mass *= 0.99
-				s.field[x][y].gain *= 0.99
-			}
-
-			/*w := 20
-			if y < int(10*math.Abs(float64((x%w)-w/2))) || 500-y < int(10*math.Abs(float64((x%w)-w/2))) {
-				s.field[x][y].mass /= 5
-			}*/
-		}
+	s.field[250][250].weight = &matter{
+		location:     s.field[250][250],
+		lastLocation: s.field[250][250],
+		speedX:       0.05,
+		mass:         0.5,
 	}
 
 	// внешнее воздействие
 	s.extInfluence = func(step int) {
-		if step < 300 {
-			s.field[0][250].speed += math.Sin(float64(step) * (math.Pi / 100))
-			s.field[0][251].speed += math.Sin(float64(step) * (math.Pi / 100))
-		}
+		//s.field[100][250].perturbationSpeed += 10 * math.Sin(float64(step)*2.0*math.Pi/50)
+		//s.field[400][250].perturbationSpeed += 10 * math.Sin(float64(step)*2.0*math.Pi/50)
 	}
 
-	g := s.simulate(500, 20, 60, 60, 60)
+	g := s.simulate(10, 20, 60)
 
 	file, err := os.Create("image.gif")
 	if err != nil {
